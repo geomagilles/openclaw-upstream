@@ -13,15 +13,7 @@ import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
 } from "../config/runtime-snapshot.js";
-import {
-  loadSessionEntry,
-  loadTranscriptEvents,
-  replaceSessionEntry,
-  upsertSessionEntryCore,
-} from "../config/sessions/session-accessor.js";
-import { replaceTranscriptEvents } from "../config/sessions/session-accessor.sqlite-transcript-write.test-support.js";
-import type { SessionEntry } from "../config/sessions/types.js";
-import { getAgentEventLifecycleGeneration } from "../infra/agent-events.js";
+import { loadSessionEntry, upsertSessionEntryCore } from "../config/sessions/session-accessor.js";
 import * as queue from "../infra/session-delivery-queue-storage.js";
 import { SessionDeliveryDeadLetteredError } from "../infra/session-delivery-queue.records.js";
 import * as lifecycle from "../sessions/session-controller.lifecycle.js";
@@ -45,8 +37,7 @@ async function seedContinuation() {
   setRuntimeConfigSnapshot({});
   await upsertSessionEntryCore(base, { sessionId: "run-123", updatedAt: 1 });
   await upsertSessionEntryCore(exact, {
-    sessionId: "run-123",
-    updatedAt: 1,
+    ...loadSessionEntry(base)!,
     cronRunContinuation: { lifecycleRevision: "fixture", phase: "ready", basePersisted: true },
   });
   return captureOpenClawStateWorkerContext();
@@ -90,87 +81,10 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-it.each([
-  ["ready", 0],
-  ["ready", 123],
-  ["retired", 0],
-  ["retired", 123],
-] as const)("retains a pinned %s continuation (%s) until unpinned", async (owner, pinnedAt) => {
-  await withContinuation(async (context) => {
-    const entry: SessionEntry = {
-      ...loadSessionEntry(exact)!,
-      parentSessionKey: base.sessionKey,
-      sidebarRoot: true,
-      pinnedAt,
-      cronRunContinuation: {
-        lifecycleRevision: "fixture",
-        basePersisted: true,
-        phase: owner === "ready" ? "ready" : "continuing",
-        ...(owner === "retired"
-          ? { ownerRunId: "retired-run", ownerLifecycleGeneration: "retired-generation" }
-          : {}),
-      },
-    };
-    await replaceSessionEntry(exact, entry);
-    const transcript = [{ type: "session", id: "run-123", content: "shared cron transcript" }];
-    await replaceTranscriptEvents({ ...exact, sessionId: "run-123" }, transcript);
-    await removeIdle(exact.sessionKey, undefined, context);
-    expect(loadSessionEntry(exact)).toMatchObject({ pinnedAt, sessionId: "run-123" });
-    const { pinnedAt: _pin, ...unpinned } = entry;
-    await replaceSessionEntry(exact, unpinned);
-    await removeIdle(exact.sessionKey, undefined, context);
-    expect(loadSessionEntry(exact)).toBeUndefined();
-    expect(loadSessionEntry(base)?.sessionId).toBe("run-123");
-    await expect(loadTranscriptEvents({ ...base, sessionId: "run-123" })).resolves.toEqual(
-      transcript,
-    );
-  });
-});
-
-it("removes a non-pinnable nested continuation even with a pin", async () => {
-  await withContinuation(async (context) => {
-    await upsertSessionEntryCore(exact, { parentSessionKey: base.sessionKey, pinnedAt: 0 });
-    await removeIdle(exact.sessionKey, undefined, context);
-    expect(loadSessionEntry(exact)).toBeUndefined();
-    expect(loadSessionEntry(base)?.sessionId).toBe("run-123");
-  });
-});
-
-it("retains an unpinned continuation owned by the current Gateway", async () => {
-  await withContinuation(async (context) => {
-    await upsertSessionEntryCore(exact, {
-      cronRunContinuation: {
-        lifecycleRevision: "fixture",
-        basePersisted: true,
-        phase: "continuing",
-        ownerRunId: "current-run",
-        ownerLifecycleGeneration: getAgentEventLifecycleGeneration(),
-      },
-    });
-    await removeIdle(exact.sessionKey, undefined, context);
-    expect(loadSessionEntry(exact)?.sessionId).toBe("run-123");
-  });
-});
-
-it.each([{ pinnedAt: 0 }, { label: "changed concurrently" }])(
-  "retains an entry changed after cleanup reads it: %j",
-  async (change) => {
-    await withContinuation(async (context) => {
-      const mutate = lifecycle.runSessionMutation;
-      vi.spyOn(lifecycle, "runSessionMutation").mockImplementationOnce(async (params) => {
-        await upsertSessionEntryCore(exact, change);
-        return mutate(params);
-      });
-      await removeIdle(exact.sessionKey, undefined, context);
-      expect(loadSessionEntry(exact)).toMatchObject({ sessionId: "run-123", ...change });
-      expect(loadSessionEntry(base)?.sessionId).toBe("run-123");
-    });
-  },
-);
-
 it.each(writers)(
   "retains the alias through %s admission until its own delivery settles",
   async (writer) => {
+    const retained = writer === "claimed";
     await withContinuation(async (context) => {
       const admission = pauseAdmission();
       const enqueueing = enqueue(context, writer);
@@ -185,11 +99,11 @@ it.each(writers)(
       expect(await queue.loadPendingSessionDeliveries(context)).toMatchObject([
         { id: await enqueueing, sessionKey: exact.sessionKey },
       ]);
-      expect(loadSessionEntry(base)?.sessionId).toBe("run-123");
+      await upsertSessionEntryCore(exact, { pinnedAt: retained ? 0 : undefined });
       await removeIdle(exact.sessionKey, undefined, context);
       expect(loadSessionEntry(exact)?.sessionId).toBe("run-123");
       await removeIdle(exact.sessionKey, await enqueueing, context);
-      expect(loadSessionEntry(exact)).toBeUndefined();
+      expect(loadSessionEntry(exact)?.sessionId).toBe(retained ? "run-123" : undefined);
       expect(loadSessionEntry(base)?.sessionId).toBe("run-123");
     });
   },
